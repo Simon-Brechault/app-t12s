@@ -5,7 +5,7 @@ from PIL import Image
 import io
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-from datetime import datetime, timedelta # NOUVEAU : Outils de temps
+from datetime import datetime, timedelta
 
 # ==========================================
 # CONFIGURATION & SÉCURITÉ
@@ -27,9 +27,6 @@ def check_password():
         st.stop()
 check_password()
 
-# ==========================================
-# OUTILS DE DATES EN FRANÇAIS
-# ==========================================
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 MOIS_FR = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
 
@@ -88,7 +85,6 @@ with st.sidebar:
 def afficher_formulaire_profil(donnees_existantes=None):
     is_edit = donnees_existantes is not None
     p = donnees_existantes if is_edit else {}
-    
     with st.form("form_profil"):
         st.subheader("👤 Informations de base")
         col1, col2, col3 = st.columns(3)
@@ -111,10 +107,12 @@ def afficher_formulaire_profil(donnees_existantes=None):
             if prenom and nom:
                 nom_complet = f"{prenom} {nom}"
                 nouveau_profil = {"prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, "temps_cuisine": temps_cuisine, "sports": sports, "allergies": allergies, "aversions": aversions}
-                if not is_edit: data_complete = {"profil": nouveau_profil, "menu_semaine": None, "notes_repas": {}, "repas_faits": [], "liste_courses": None}
+                # NOUVEAU : On utilise "menus_sauvegardes" pour stocker plusieurs semaines
+                if not is_edit: data_complete = {"profil": nouveau_profil, "menus_sauvegardes": {}, "notes_repas": {}, "repas_faits": []}
                 else:
                     data_complete = bdd_users[nom_complet]
                     data_complete["profil"] = nouveau_profil
+                    if "menus_sauvegardes" not in data_complete: data_complete["menus_sauvegardes"] = {}
                 sauvegarder_utilisateur(nom_complet, data_complete)
                 st.session_state["edit_mode"] = False
                 st.success("Profil enregistré ! Actualisation...")
@@ -129,10 +127,8 @@ elif choix_user == "➕ Créer un nouveau profil":
     afficher_formulaire_profil()
     st.stop()
 
-# ==========================================
-# VARIABLES DU PROFIL ACTUEL
-# ==========================================
 current_user_data = bdd_users[choix_user]
+if "menus_sauvegardes" not in current_user_data: current_user_data["menus_sauvegardes"] = {}
 profil = current_user_data.get("profil", {})
 
 if "edit_mode" not in st.session_state: st.session_state["edit_mode"] = False
@@ -146,38 +142,46 @@ if st.session_state["edit_mode"]:
 
 def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
 
-menu_semaine = current_user_data.get("menu_semaine")
 notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
-liste_courses = current_user_data.get("liste_courses")
 
 # ==========================================
-# FONCTIONS API GEMINI (AVEC DATES)
+# FONCTIONS API GEMINI (AVEC CONFIGURATION)
 # ==========================================
-def generer_repas(envies, jours_a_generer, photos=None, mode_strict=False):
+def generer_repas_intelligent(envies, config_semaine, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     repas_a_eviter = [plat for plat, note in notes_repas.items() if note is not None and note <= 2]
 
     prompt = f"""
     Tu es un coach expert. Crée un menu sur-mesure pour {profil['prenom']}.
-    Objectif : {profil['objectif']} | Poids : {profil['poids']}kg | Sports pratiqués : {profil['sports']}
-    Allergies : {profil['allergies']} | Temps max en cuisine : {profil['temps_cuisine']}.
+    Objectif : {profil['objectif']} | Poids : {profil['poids']}kg.
+    Allergies : {profil['allergies']} | Aversions : {profil['aversions']} | Temps max : {profil['temps_cuisine']}.
     
-    IMPORTANT : Voici les dates exactes de la semaine à planifier : {jours_a_generer}.
-    Adapte tes recettes avec des fruits et légumes de saison correspondants à ces dates !
-    Envies de la semaine : {envies if envies else "Varié"}.
+    VOICI LA CONFIGURATION EXACTE DE LA SEMAINE :
     """
     
+    for jour, config in config_semaine.items():
+        prompt += f"\n- {jour} :"
+        prompt += f"\n  Repas à générer : {', '.join(config['repas']) if config['repas'] else 'AUCUN REPAS CE JOUR LA'}"
+        if config['sport'] != "Aucun":
+            prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}. (Augmente l'apport en protéines/glucides de récupération !)"
+        if config['partenaire'] != "Personne":
+            # On va chercher les allergies du partenaire dans la BDD !
+            partenaire_data = bdd_users.get(config['partenaire'], {}).get("profil", {})
+            allergies_partenaire = partenaire_data.get("allergies", "Aucune")
+            prompt += f"\n  ATTENTION : Le repas du Soir sera partagé avec {config['partenaire']}. Tu dois ABSOLUMENT respecter ses allergies aussi : {allergies_partenaire}."
+
+    prompt += f"\n\nEnvies générales : {envies if envies else 'Varié'}."
+    prompt += f"\nRepas interdits (déjà mal notés) : {repas_a_eviter}."
+    
     if photos:
-        if mode_strict: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos (0 courses)."
+        if mode_strict: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos."
         else: prompt += "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
-    # On demande à Gemini de reprendre exactement les dates comme clés du JSON
     prompt += """
-    Format JSON attendu (utilise EXACTEMENT les dates fournies comme clés, ex: 'Lundi 14 Mars 2026') :
+    RÉPOND UNIQUEMENT EN JSON avec cette structure (ne mets que les repas demandés pour chaque jour) :
     {
-      "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}},
-      "Date 2": {"Matin": {...}, "Midi": {...}, "Soir": {...}}
+      "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}
     }
     """
 
@@ -196,38 +200,72 @@ def generer_repas(envies, jours_a_generer, photos=None, mode_strict=False):
         return None
 
 # ==========================================
-# INTERFACE PRINCIPALE (CALENDRIER)
+# INTERFACE PRINCIPALE (PROGRAMMATION)
 # ==========================================
 st.title(f"🍽️ Planificateur de {profil.get('prenom', '')}")
 
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("📅 Planification")
-    
-    # LE FAMEUX CALENDRIER
-    date_debut = st.date_input("Date de début de la semaine", datetime.today())
-    # On calcule les 7 jours à partir de la date choisie
+# 1. Menu déroulant pour voir les semaines sauvegardées
+liste_semaines = list(current_user_data.get("menus_sauvegardes", {}).keys())
+semaine_a_afficher = None
+
+col_aff1, col_aff2 = st.columns([0.7, 0.3])
+if liste_semaines:
+    semaine_selectionnee = col_aff2.selectbox("📂 Voir une semaine sauvegardée :", ["-- Nouvelle programmation --"] + liste_semaines)
+    if semaine_selectionnee != "-- Nouvelle programmation --":
+        semaine_a_afficher = current_user_data["menus_sauvegardes"][semaine_selectionnee]
+
+# 2. Si on est en mode "Nouvelle programmation", on affiche le panneau de contrôle
+if not semaine_a_afficher:
+    st.subheader("🗓️ Programmer une nouvelle semaine")
+    date_debut = st.date_input("Date de début", datetime.today())
     jours_generes = [formater_date_fr(date_debut + timedelta(days=i)) for i in range(7)]
+    identifiant_semaine = f"Semaine du {jours_generes[0]}"
     
+    if identifiant_semaine in liste_semaines:
+        st.warning("⚠️ Une programmation existe déjà pour cette semaine. Si vous générez, elle sera écrasée.")
+
+    st.markdown("### ⚙️ Configuration jour par jour")
+    config_semaine = {}
+    
+    sports_dispos = ["Aucun"] + [s.strip() for s in profil.get("sports", "").split(",") if s.strip()]
+    autres_profils = ["Personne"] + [u for u in bdd_users.keys() if u not in [choix_user, "-- Choisir un profil --", "➕ Créer un nouveau profil"]]
+
+    # Panneau de contrôle accordéon
+    for jour in jours_generes:
+        with st.expander(f"Paramétrer le {jour}"):
+            c1, c2, c3 = st.columns(3)
+            repas = c1.multiselect("Repas à prévoir", ["Matin", "Midi", "Soir"], default=["Matin", "Midi", "Soir"], key=f"r_{jour}")
+            sport = c2.selectbox("Sport ce jour", sports_dispos, key=f"s_{jour}")
+            temps = c2.text_input("Durée (ex: 1h30)", key=f"t_{jour}") if sport != "Aucun" else ""
+            partenaire = c3.selectbox("Repas partagé le Soir ?", autres_profils, key=f"p_{jour}")
+            
+            config_semaine[jour] = {"repas": repas, "sport": sport, "temps_sport": temps, "partenaire": partenaire}
+
+    with st.sidebar:
+        st.markdown("---")
+        envies = st.text_area("💭 Envies particulières ?")
+        photos_frigo = st.file_uploader("Prendre le stock en photo", type=["jpg", "png"], accept_multiple_files=True)
+        mode_strict = st.checkbox("🚨 Mode Strict (0 courses)") if photos_frigo else False
+
+        if st.button("🪄 Générer ma semaine"):
+            with st.spinner(f"Création de la {identifiant_semaine}..."):
+                nouveau_menu = generer_repas_intelligent(envies, config_semaine, photos_frigo, mode_strict)
+                if nouveau_menu:
+                    # On sauvegarde la semaine avec son identifiant !
+                    current_user_data["menus_sauvegardes"][identifiant_semaine] = {
+                        "menu": nouveau_menu,
+                        "liste_courses": None # La liste de course est maintenant spécifique à la semaine
+                    }
+                    save_current()
+                    st.rerun()
+
+# 3. Affichage du menu (si une semaine est sélectionnée ou vient d'être générée)
+else:
     st.markdown("---")
-    envies = st.text_area("💭 Mes envies")
-    st.subheader("📸 Inventaire")
-    photos_frigo = st.file_uploader("Prendre en photo le stock", type=["jpg", "png"], accept_multiple_files=True)
-    mode_strict = st.checkbox("🚨 Mode Strict (Cuisiner uniquement avec le stock)") if photos_frigo else False
-
-    if st.button("🪄 Générer le menu (7 jours)"):
-        with st.spinner(f"Création du menu pour la semaine du {jours_generes[0]}..."):
-            # On envoie la liste des 7 jours exacts à Gemini !
-            nouveau = generer_repas(envies, jours_generes, photos_frigo, mode_strict)
-            if nouveau:
-                current_user_data["menu_semaine"] = nouveau # On remplace l'ancien menu
-                save_current()
-                st.rerun()
-
-if menu_semaine:
-    st.info(f"Semaine planifiée : Vous avez sélectionné vos repas en fonction de votre calendrier.")
-    tabs = st.tabs(list(menu_semaine.keys()))
-    for i, (jour, repas_jour) in enumerate(menu_semaine.items()):
+    menu = semaine_a_afficher["menu"]
+    tabs = st.tabs(list(menu.keys()))
+    
+    for i, (jour, repas_jour) in enumerate(menu.items()):
         with tabs[i]:
             for moment in ["Matin", "Midi", "Soir"]:
                 if moment in repas_jour:
@@ -243,11 +281,11 @@ if menu_semaine:
                         with st.expander("Voir recette"): st.write(plat['recette'])
 
     st.markdown("---")
-    if st.button("📝 Faire la liste de courses"):
+    if st.button("📝 Faire la liste de courses pour CETTE semaine"):
         client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-        res = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=f"Fais la liste de courses pour ce menu : {json.dumps(menu_semaine)}. Format Markdown cases à cocher.")
-        current_user_data["liste_courses"] = res.text
+        res = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=f"Fais la liste de courses pour ce menu : {json.dumps(menu)}. Format Markdown cases à cocher.")
+        semaine_a_afficher["liste_courses"] = res.text
         save_current(); st.rerun()
-    if liste_courses: st.markdown(liste_courses)
-else:
-    st.info("👈 Choisissez une date de début et générez votre menu à gauche.")
+        
+    if semaine_a_afficher.get("liste_courses"): 
+        st.markdown(semaine_a_afficher["liste_courses"])
