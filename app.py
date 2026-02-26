@@ -2,41 +2,57 @@ import streamlit as st
 from google import genai
 import json
 from PIL import Image
-import io  # Nécessaire pour la gestion de la compression en mémoire
+import io
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 
 # ==========================================
-# CONFIGURATION & INITIALISATION
+# CONFIGURATION & SÉCURITÉ
 # ==========================================
 st.set_page_config(page_title="T12S Meal Planner Pro", layout="wide")
 
+# --- BARRIÈRE DE SÉCURITÉ ---
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        st.title("🔒 Accès Restreint")
+        st.write("Veuillez entrer le mot de passe pour accéder à l'application.")
+        pwd = st.text_input("Mot de passe", type="password")
+        if st.button("Valider"):
+            if pwd == st.secrets.get("APP_PASSWORD", "T12S"):
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect ❌")
+        st.stop() # Bloque tout le reste du code si pas de mot de passe
+
+check_password() # On appelle la fonction de sécurité
+
+# ==========================================
+# BASE DE DONNÉES
+# ==========================================
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def charger_bdd():
     try:
-        # ttl=0 force la relecture du Google Sheet pour voir les nouveaux profils immédiatement
         df = conn.read(worksheet="BDD", usecols=[0, 1], ttl=0)
-        if df.empty or len(df.columns) < 2:
-            return {}
-        
+        if df.empty or len(df.columns) < 2: return {}
         df.columns = ['Utilisateur', 'Data']
         users = {}
         for _, row in df.iterrows():
             if pd.notna(row['Utilisateur']) and pd.notna(row['Data']):
-                try:
-                    users[row['Utilisateur']] = json.loads(row['Data'])
-                except:
-                    pass
+                try: users[row['Utilisateur']] = json.loads(row['Data'])
+                except: pass
         return users
     except Exception as e:
-        st.error(f"Erreur de lecture BDD: {e}")
+        st.error(f"Erreur BDD: {e}")
         return {}
 
 def sauvegarder_utilisateur(nom_utilisateur, data_dict):
     users = charger_bdd()
     users[nom_utilisateur] = data_dict
-    
     df = pd.DataFrame({
         "Utilisateur": list(users.keys()),
         "Data": [json.dumps(v, ensure_ascii=False) for v in users.values()]
@@ -47,25 +63,16 @@ def sauvegarder_utilisateur(nom_utilisateur, data_dict):
 # FONCTION DE COMPRESSION DES IMAGES
 # ==========================================
 def compresser_image(image_file, max_size=(800, 800)):
-    """Redimensionne et compresse l'image pour un envoi ultra-rapide à l'IA."""
     img = Image.open(image_file)
-    
-    # Correction de l'orientation et conversion RGB pour JPEG
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    
-    # Redimensionnement proportionnel (max 800px)
+    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
     img.thumbnail(max_size)
-    
-    # Compression en mémoire
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=75, optimize=True)
     buffer.seek(0)
-    
     return Image.open(buffer)
 
 # ==========================================
-# GESTION DES PROFILS (MULTI-UTILISATEURS)
+# GESTION DES PROFILS (CRÉATION & MODIFICATION)
 # ==========================================
 bdd_users = charger_bdd()
 liste_utilisateurs = ["-- Choisir un profil --", "➕ Créer un nouveau profil"] + list(bdd_users.keys())
@@ -73,6 +80,56 @@ liste_utilisateurs = ["-- Choisir un profil --", "➕ Créer un nouveau profil"]
 with st.sidebar:
     st.title("👤 Mon Profil")
     choix_user = st.selectbox("Qui êtes-vous ?", liste_utilisateurs)
+
+# --- FONCTION POUR AFFICHER LE FORMULAIRE DE PROFIL ---
+def afficher_formulaire_profil(donnees_existantes=None):
+    is_edit = donnees_existantes is not None
+    p = donnees_existantes if is_edit else {}
+    
+    with st.form("form_profil"):
+        st.subheader("👤 Informations de base")
+        col1, col2, col3 = st.columns(3)
+        prenom = col1.text_input("Prénom", value=p.get("prenom", ""))
+        nom = col2.text_input("Nom", value=p.get("nom", ""))
+        poids = col3.number_input("Poids (kg)", min_value=30, max_value=200, value=int(p.get("poids", 70)))
+        
+        st.subheader("🎯 Objectifs & Mode de vie")
+        objectif = st.selectbox("Objectif principal", [
+            "Perte de poids (Style T12S)", "Maintien & Santé", "Prise de masse musculaire", "Végétarien Gourmand"
+        ], index=0 if not is_edit else ["Perte de poids (Style T12S)", "Maintien & Santé", "Prise de masse musculaire", "Végétarien Gourmand"].index(p.get("objectif", "Perte de poids (Style T12S)")))
+        
+        temps_cuisine = st.selectbox("Temps en cuisine par repas", [
+            "Moins de 15 min", "15 à 30 min", "Plus de 30 min"
+        ], index=0 if not is_edit else ["Moins de 15 min", "15 à 30 min", "Plus de 30 min"].index(p.get("temps_cuisine", "15 à 30 min")))
+
+        st.subheader("🏃‍♂️ Activité Sportive")
+        sports = st.text_input("Quels sports pratiquez-vous ? (Séparés par des virgules)", value=p.get("sports", ""), placeholder="ex: Musculation, Vélo, Course à pied")
+
+        st.subheader("🚫 Contraintes")
+        allergies = st.text_input("Allergies (ex: Gluten, Lactose...)", value=p.get("allergies", ""))
+        aversions = st.text_input("Ce que vous détestez", value=p.get("aversions", ""))
+        
+        submit_text = "Mettre à jour mon profil" if is_edit else "Créer mon profil"
+        if st.form_submit_button(submit_text):
+            if prenom and nom:
+                nom_complet = f"{prenom} {nom}"
+                nouveau_profil = {
+                    "prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, 
+                    "temps_cuisine": temps_cuisine, "sports": sports, 
+                    "allergies": allergies, "aversions": aversions
+                }
+                
+                # Si création, on initialise les menus vides. Si modification, on garde l'historique !
+                if not is_edit:
+                    data_complete = {"profil": nouveau_profil, "menu_semaine": None, "notes_repas": {}, "repas_faits": [], "liste_courses": None}
+                else:
+                    data_complete = bdd_users[nom_complet]
+                    data_complete["profil"] = nouveau_profil
+                
+                sauvegarder_utilisateur(nom_complet, data_complete)
+                st.session_state["edit_mode"] = False
+                st.success("Profil enregistré ! Actualisation...")
+                st.rerun()
 
 # --- ECRAN D'ACCUEIL ---
 if choix_user == "-- Choisir un profil --":
@@ -83,50 +140,30 @@ if choix_user == "-- Choisir un profil --":
 # --- ECRAN DE CREATION DE PROFIL ---
 elif choix_user == "➕ Créer un nouveau profil":
     st.title("🆕 Bilan Nutritionnel & Profil")
-    st.write("Répondez à ce questionnaire pour personnaliser vos futurs menus.")
-    
-    with st.form("form_creation"):
-        st.subheader("👤 Informations de base")
-        col1, col2 = st.columns(2)
-        prenom = col1.text_input("Prénom")
-        nom = col2.text_input("Nom")
-        
-        st.subheader("🎯 Vos Objectifs")
-        objectif = st.selectbox("Quel est votre objectif principal ?", [
-            "Perte de poids (Style T12S - Sain, équilibré, sans frustration)", 
-            "Maintien & Santé (Manger mieux au quotidien)", 
-            "Prise de masse musculaire (Riche en protéines)", 
-            "Végétarien Gourmand"
-        ])
-        
-        st.subheader("🔥 Mode de vie")
-        col3, col4 = st.columns(2)
-        activite = col3.selectbox("Niveau d'activité physique", ["Sédentaire", "Actif", "Sportif régulier"])
-        temps_cuisine = col4.selectbox("Temps en cuisine par repas", ["Moins de 15 min", "15 à 30 min", "Plus de 30 min"])
-
-        st.subheader("🚫 Contraintes")
-        allergies = st.text_input("Allergies (ex: Gluten, Lactose...)", placeholder="Aucune")
-        aversions = st.text_input("Ce que vous détestez", placeholder="Rien")
-        
-        if st.form_submit_button("Valider mon profil"):
-            if prenom and nom:
-                nom_complet = f"{prenom} {nom}"
-                nouveau_profil = {
-                    "profil": {"prenom": prenom, "nom": nom, "objectif": objectif, "activite": activite, "temps_cuisine": temps_cuisine, "allergies": allergies, "aversions": aversions},
-                    "menu_semaine": None, "notes_repas": {}, "repas_faits": [], "liste_courses": None
-                }
-                sauvegarder_utilisateur(nom_complet, nouveau_profil)
-                st.success("Profil créé ! La page va s'actualiser...")
-                st.rerun()
+    afficher_formulaire_profil()
     st.stop()
 
 # ==========================================
-# VARIABLES DU PROFIL ACTUEL
+# VARIABLES DU PROFIL ACTUEL & MODIFICATION
 # ==========================================
 current_user_data = bdd_users[choix_user]
+profil = current_user_data.get("profil", {})
+
+# Gestion du mode "Modification"
+if "edit_mode" not in st.session_state:
+    st.session_state["edit_mode"] = False
+
+with st.sidebar:
+    if st.button("⚙️ Modifier mon profil"):
+        st.session_state["edit_mode"] = not st.session_state["edit_mode"]
+
+if st.session_state["edit_mode"]:
+    st.title("⚙️ Modification du profil")
+    afficher_formulaire_profil(donnees_existantes=profil)
+    st.stop()
+
 def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
 
-profil = current_user_data.get("profil", {})
 menu_semaine = current_user_data.get("menu_semaine")
 notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
@@ -134,7 +171,7 @@ liste_courses = current_user_data.get("liste_courses")
 jours_semaine = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 
 # ==========================================
-# FONCTIONS API GEMINI
+# FONCTIONS API GEMINI (TEMPORAIRE AVANT VRAI CALENDRIER)
 # ==========================================
 def generer_repas(envies, jour_debut_index, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
@@ -143,27 +180,22 @@ def generer_repas(envies, jour_debut_index, photos=None, mode_strict=False):
 
     prompt = f"""
     Tu es un coach expert. Crée un menu sur-mesure pour {profil['prenom']}.
-    Objectif : {profil['objectif']} | Allergies : {profil['allergies']} | Temps : {profil['temps_cuisine']}.
+    Objectif : {profil['objectif']} | Poids : {profil['poids']}kg | Sports pratiqués : {profil['sports']}
+    Allergies : {profil['allergies']} | Temps max en cuisine : {profil['temps_cuisine']}.
     Menu pour : {jours_a_generer}. Envies : {envies if envies else "Varié"}.
     """
     
     if photos:
-        if mode_strict:
-            prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos (0 courses)."
-        else:
-            prompt += "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
+        if mode_strict: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos (0 courses)."
+        else: prompt += "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
     prompt += "\nFormat JSON attendu : {'Jour': {'Matin': {'titre': '...', 'recette': '...', 'calories_estimees': '...'}}}"
 
     contenu_a_envoyer = [prompt]
-    
-    # Compression et ajout des photos
     if photos:
         for p in photos:
-            try:
-                contenu_a_envoyer.append(compresser_image(p))
-            except:
-                pass
+            try: contenu_a_envoyer.append(compresser_image(p))
+            except: pass
 
     try:
         response = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=contenu_a_envoyer)
@@ -174,7 +206,7 @@ def generer_repas(envies, jour_debut_index, photos=None, mode_strict=False):
         return None
 
 # ==========================================
-# INTERFACE PRINCIPALE
+# INTERFACE PRINCIPALE (TEMPORAIRE AVANT CALENDRIER)
 # ==========================================
 st.title(f"🍽️ Planificateur de {profil.get('prenom', '')}")
 
