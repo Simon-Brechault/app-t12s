@@ -107,7 +107,6 @@ def afficher_formulaire_profil(donnees_existantes=None):
             if prenom and nom:
                 nom_complet = f"{prenom} {nom}"
                 nouveau_profil = {"prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, "temps_cuisine": temps_cuisine, "sports": sports, "allergies": allergies, "aversions": aversions}
-                # NOUVEAU : On utilise "menus_sauvegardes" pour stocker plusieurs semaines
                 if not is_edit: data_complete = {"profil": nouveau_profil, "menus_sauvegardes": {}, "notes_repas": {}, "repas_faits": []}
                 else:
                     data_complete = bdd_users[nom_complet]
@@ -146,9 +145,9 @@ notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
 
 # ==========================================
-# FONCTIONS API GEMINI (AVEC CONFIGURATION)
+# FONCTIONS API GEMINI (AVEC SYNCHRONISATION)
 # ==========================================
-def generer_repas_intelligent(envies, config_semaine, photos=None, mode_strict=False):
+def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     repas_a_eviter = [plat for plat, note in notes_repas.items() if note is not None and note <= 2]
 
@@ -164,12 +163,20 @@ def generer_repas_intelligent(envies, config_semaine, photos=None, mode_strict=F
         prompt += f"\n- {jour} :"
         prompt += f"\n  Repas à générer : {', '.join(config['repas']) if config['repas'] else 'AUCUN REPAS CE JOUR LA'}"
         if config['sport'] != "Aucun":
-            prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}. (Augmente l'apport en protéines/glucides de récupération !)"
+            prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}. (Adapte les portions en conséquence !)"
+        
+        # --- LA MAGIE DE LA SYNCHRONISATION (LECTURE) ---
         if config['partenaire'] != "Personne":
-            # On va chercher les allergies du partenaire dans la BDD !
-            partenaire_data = bdd_users.get(config['partenaire'], {}).get("profil", {})
-            allergies_partenaire = partenaire_data.get("allergies", "Aucune")
-            prompt += f"\n  ATTENTION : Le repas du Soir sera partagé avec {config['partenaire']}. Tu dois ABSOLUMENT respecter ses allergies aussi : {allergies_partenaire}."
+            partenaire = config['partenaire']
+            partenaire_data = bdd_users.get(partenaire, {})
+            # On vérifie si le partenaire a déjà généré cette semaine et ce repas du soir
+            repas_existant = partenaire_data.get("menus_sauvegardes", {}).get(identifiant_semaine, {}).get("menu", {}).get(jour, {}).get("Soir")
+            
+            if repas_existant:
+                prompt += f"\n  🚨 ATTENTION : Le repas du Soir est partagé avec {partenaire} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS IMPÉRATIVEMENT intégrer cette recette exacte pour le Soir de {profil['prenom']}."
+            else:
+                allergies_partenaire = partenaire_data.get("profil", {}).get("allergies", "Aucune")
+                prompt += f"\n  🤝 Le repas du Soir sera partagé avec {partenaire}. Tu dois ABSOLUMENT respecter ses allergies aussi pour ce repas : {allergies_partenaire}."
 
     prompt += f"\n\nEnvies générales : {envies if envies else 'Varié'}."
     prompt += f"\nRepas interdits (déjà mal notés) : {repas_a_eviter}."
@@ -179,7 +186,7 @@ def generer_repas_intelligent(envies, config_semaine, photos=None, mode_strict=F
         else: prompt += "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
     prompt += """
-    RÉPOND UNIQUEMENT EN JSON avec cette structure (ne mets que les repas demandés pour chaque jour) :
+    RÉPOND UNIQUEMENT EN JSON avec cette structure :
     {
       "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}
     }
@@ -200,11 +207,10 @@ def generer_repas_intelligent(envies, config_semaine, photos=None, mode_strict=F
         return None
 
 # ==========================================
-# INTERFACE PRINCIPALE (PROGRAMMATION)
+# INTERFACE PRINCIPALE
 # ==========================================
 st.title(f"🍽️ Planificateur de {profil.get('prenom', '')}")
 
-# 1. Menu déroulant pour voir les semaines sauvegardées
 liste_semaines = list(current_user_data.get("menus_sauvegardes", {}).keys())
 semaine_a_afficher = None
 
@@ -214,7 +220,7 @@ if liste_semaines:
     if semaine_selectionnee != "-- Nouvelle programmation --":
         semaine_a_afficher = current_user_data["menus_sauvegardes"][semaine_selectionnee]
 
-# 2. Si on est en mode "Nouvelle programmation", on affiche le panneau de contrôle
+# --- MODE CREATION ---
 if not semaine_a_afficher:
     st.subheader("🗓️ Programmer une nouvelle semaine")
     date_debut = st.date_input("Date de début", datetime.today())
@@ -230,7 +236,6 @@ if not semaine_a_afficher:
     sports_dispos = ["Aucun"] + [s.strip() for s in profil.get("sports", "").split(",") if s.strip()]
     autres_profils = ["Personne"] + [u for u in bdd_users.keys() if u not in [choix_user, "-- Choisir un profil --", "➕ Créer un nouveau profil"]]
 
-    # Panneau de contrôle accordéon
     for jour in jours_generes:
         with st.expander(f"Paramétrer le {jour}"):
             c1, c2, c3 = st.columns(3)
@@ -249,17 +254,35 @@ if not semaine_a_afficher:
 
         if st.button("🪄 Générer ma semaine"):
             with st.spinner(f"Création de la {identifiant_semaine}..."):
-                nouveau_menu = generer_repas_intelligent(envies, config_semaine, photos_frigo, mode_strict)
+                nouveau_menu = generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos_frigo, mode_strict)
                 if nouveau_menu:
-                    # On sauvegarde la semaine avec son identifiant !
-                    current_user_data["menus_sauvegardes"][identifiant_semaine] = {
-                        "menu": nouveau_menu,
-                        "liste_courses": None # La liste de course est maintenant spécifique à la semaine
-                    }
+                    # 1. Sauvegarde pour l'utilisateur qui a cliqué
+                    current_user_data["menus_sauvegardes"][identifiant_semaine] = {"menu": nouveau_menu, "liste_courses": None}
                     save_current()
+
+                    # 2. --- LA MAGIE DE LA SYNCHRONISATION (ECRITURE CHEZ L'AUTRE) ---
+                    for jour, config in config_semaine.items():
+                        partenaire = config['partenaire']
+                        if partenaire != "Personne" and partenaire in bdd_users:
+                            partenaire_data = bdd_users[partenaire]
+                            repas_existant = partenaire_data.get("menus_sauvegardes", {}).get(identifiant_semaine, {}).get("menu", {}).get(jour, {}).get("Soir")
+                            
+                            # Si le partenaire n'avait rien prévu ce soir-là, on lui force le plat partagé !
+                            if not repas_existant and jour in nouveau_menu and "Soir" in nouveau_menu[jour]:
+                                if "menus_sauvegardes" not in partenaire_data: partenaire_data["menus_sauvegardes"] = {}
+                                if identifiant_semaine not in partenaire_data["menus_sauvegardes"]: partenaire_data["menus_sauvegardes"][identifiant_semaine] = {"menu": {}, "liste_courses": None}
+                                if jour not in partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"]: partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"][jour] = {}
+                                
+                                plat_partage = nouveau_menu[jour]["Soir"].copy()
+                                plat_partage["titre"] = f"🤝 {plat_partage['titre']} (Prévu par {profil.get('prenom', 'Quelqu\'un')})"
+                                
+                                partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"][jour]["Soir"] = plat_partage
+                                sauvegarder_utilisateur(partenaire, partenaire_data) # On enregistre dans la base de données du partenaire !
+                    
+                    st.success("Menu généré et synchronisé avec succès !")
                     st.rerun()
 
-# 3. Affichage du menu (si une semaine est sélectionnée ou vient d'être générée)
+# --- AFFICHAGE ---
 else:
     st.markdown("---")
     menu = semaine_a_afficher["menu"]
@@ -280,12 +303,21 @@ else:
                         st.subheader(f"{moment} : {plat['titre']}")
                         with st.expander("Voir recette"): st.write(plat['recette'])
 
+    # --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
     st.markdown("---")
     if st.button("📝 Faire la liste de courses pour CETTE semaine"):
-        client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-        res = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=f"Fais la liste de courses pour ce menu : {json.dumps(menu)}. Format Markdown cases à cocher.")
-        semaine_a_afficher["liste_courses"] = res.text
-        save_current(); st.rerun()
+        with st.spinner("Rédaction de la liste en cours..."):
+            try:
+                client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+                res = client.models.generate_content(
+                    model=st.secrets["GEMINI_MODEL"], 
+                    contents=f"Fais la liste de courses détaillée et triée par rayon pour ce menu : {json.dumps(menu)}. Format Markdown avec des cases à cocher."
+                )
+                semaine_a_afficher["liste_courses"] = res.text
+                save_current()
+                st.rerun()
+            except Exception as e:
+                st.error("Les serveurs de Google sont un peu surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
         
     if semaine_a_afficher.get("liste_courses"): 
         st.markdown(semaine_a_afficher["liste_courses"])
