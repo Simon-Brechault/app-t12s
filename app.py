@@ -126,8 +126,46 @@ elif choix_user == "➕ Créer un nouveau profil":
     afficher_formulaire_profil()
     st.stop()
 
+# ==========================================
+# 🧹 NETTOYAGE AUTOMATIQUE (GARBAGE COLLECTOR)
+# ==========================================
 current_user_data = bdd_users[choix_user]
 if "menus_sauvegardes" not in current_user_data: current_user_data["menus_sauvegardes"] = {}
+
+def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
+
+def nettoyer_anciennes_semaines():
+    aujourd_hui = datetime.today().date()
+    # On trouve la date exacte du Lundi de la semaine en cours
+    lundi_courant = aujourd_hui - timedelta(days=aujourd_hui.weekday())
+    
+    semaines_a_supprimer = []
+    for id_semaine, data_semaine in current_user_data.get("menus_sauvegardes", {}).items():
+        date_iso = data_semaine.get("date_iso")
+        if date_iso:
+            date_semaine = datetime.fromisoformat(date_iso).date()
+            # Si la date de début de la semaine sauvegardée est avant le lundi actuel
+            if date_semaine < lundi_courant:
+                semaines_a_supprimer.append(id_semaine)
+                
+    if semaines_a_supprimer:
+        for s in semaines_a_supprimer:
+            del current_user_data["menus_sauvegardes"][s] # Supprime le menu
+            
+        # Nettoyage des cases "Fait" pour ne pas encombrer la mémoire avec des repas supprimés
+        jours_gardes = []
+        for semaine_data in current_user_data["menus_sauvegardes"].values():
+            jours_gardes.extend(semaine_data["menu"].keys())
+            
+        current_user_data["repas_faits"] = [
+            rid for rid in current_user_data.get("repas_faits", [])
+            if any(rid.startswith(jour) for jour in jours_gardes)
+        ]
+        save_current()
+
+# On lance le nettoyage discrètement à chaque ouverture du profil
+nettoyer_anciennes_semaines()
+
 profil = current_user_data.get("profil", {})
 
 if "edit_mode" not in st.session_state: st.session_state["edit_mode"] = False
@@ -139,13 +177,11 @@ if st.session_state["edit_mode"]:
     afficher_formulaire_profil(donnees_existantes=profil)
     st.stop()
 
-def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
-
 notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
 
 # ==========================================
-# FONCTIONS API GEMINI (AVEC SYNCHRONISATION)
+# FONCTIONS API GEMINI
 # ==========================================
 def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
@@ -158,39 +194,22 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photo
     
     VOICI LA CONFIGURATION EXACTE DE LA SEMAINE :
     """
-    
     for jour, config in config_semaine.items():
         prompt += f"\n- {jour} :"
         prompt += f"\n  Repas à générer : {', '.join(config['repas']) if config['repas'] else 'AUCUN REPAS CE JOUR LA'}"
-        if config['sport'] != "Aucun":
-            prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}. (Adapte les portions en conséquence !)"
-        
-        # --- LA MAGIE DE LA SYNCHRONISATION (LECTURE) ---
+        if config['sport'] != "Aucun": prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}."
         if config['partenaire'] != "Personne":
-            partenaire = config['partenaire']
-            partenaire_data = bdd_users.get(partenaire, {})
-            # On vérifie si le partenaire a déjà généré cette semaine et ce repas du soir
+            partenaire_data = bdd_users.get(config['partenaire'], {})
             repas_existant = partenaire_data.get("menus_sauvegardes", {}).get(identifiant_semaine, {}).get("menu", {}).get(jour, {}).get("Soir")
-            
-            if repas_existant:
-                prompt += f"\n  🚨 ATTENTION : Le repas du Soir est partagé avec {partenaire} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS IMPÉRATIVEMENT intégrer cette recette exacte pour le Soir de {profil['prenom']}."
-            else:
-                allergies_partenaire = partenaire_data.get("profil", {}).get("allergies", "Aucune")
-                prompt += f"\n  🤝 Le repas du Soir sera partagé avec {partenaire}. Tu dois ABSOLUMENT respecter ses allergies aussi pour ce repas : {allergies_partenaire}."
+            if repas_existant: prompt += f"\n  🚨 Le repas du Soir est partagé avec {config['partenaire']} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS IMPÉRATIVEMENT intégrer cette recette pour le Soir."
+            else: prompt += f"\n  🤝 Le repas du Soir sera partagé avec {config['partenaire']}. Respecte ses allergies : {partenaire_data.get('profil', {}).get('allergies', 'Aucune')}."
 
     prompt += f"\n\nEnvies générales : {envies if envies else 'Varié'}."
     prompt += f"\nRepas interdits (déjà mal notés) : {repas_a_eviter}."
-    
-    if photos:
-        if mode_strict: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos."
-        else: prompt += "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
+    if photos: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos." if mode_strict else "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
-    prompt += """
-    RÉPOND UNIQUEMENT EN JSON avec cette structure :
-    {
-      "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}
-    }
-    """
+    prompt += """\nRÉPOND UNIQUEMENT EN JSON avec cette structure :
+    {"Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}}"""
 
     contenu_a_envoyer = [prompt]
     if photos:
@@ -216,11 +235,10 @@ semaine_a_afficher = None
 
 col_aff1, col_aff2 = st.columns([0.7, 0.3])
 if liste_semaines:
-    semaine_selectionnee = col_aff2.selectbox("📂 Voir une semaine sauvegardée :", ["-- Nouvelle programmation --"] + liste_semaines)
+    semaine_selectionnee = col_aff2.selectbox("📂 Voir une semaine :", ["-- Nouvelle programmation --"] + liste_semaines)
     if semaine_selectionnee != "-- Nouvelle programmation --":
         semaine_a_afficher = current_user_data["menus_sauvegardes"][semaine_selectionnee]
 
-# --- MODE CREATION ---
 if not semaine_a_afficher:
     st.subheader("🗓️ Programmer une nouvelle semaine")
     date_debut = st.date_input("Date de début", datetime.today())
@@ -232,7 +250,6 @@ if not semaine_a_afficher:
 
     st.markdown("### ⚙️ Configuration jour par jour")
     config_semaine = {}
-    
     sports_dispos = ["Aucun"] + [s.strip() for s in profil.get("sports", "").split(",") if s.strip()]
     autres_profils = ["Personne"] + [u for u in bdd_users.keys() if u not in [choix_user, "-- Choisir un profil --", "➕ Créer un nouveau profil"]]
 
@@ -240,84 +257,87 @@ if not semaine_a_afficher:
         with st.expander(f"Paramétrer le {jour}"):
             c1, c2, c3 = st.columns(3)
             repas = c1.multiselect("Repas à prévoir", ["Matin", "Midi", "Soir"], default=["Matin", "Midi", "Soir"], key=f"r_{jour}")
-            sport = c2.selectbox("Sport ce jour", sports_dispos, key=f"s_{jour}")
+            sport = c2.selectbox("Sport", sports_dispos, key=f"s_{jour}")
             temps = c2.text_input("Durée (ex: 1h30)", key=f"t_{jour}") if sport != "Aucun" else ""
-            partenaire = c3.selectbox("Repas partagé le Soir ?", autres_profils, key=f"p_{jour}")
-            
+            partenaire = c3.selectbox("Partager le Soir ?", autres_profils, key=f"p_{jour}")
             config_semaine[jour] = {"repas": repas, "sport": sport, "temps_sport": temps, "partenaire": partenaire}
 
     with st.sidebar:
         st.markdown("---")
         envies = st.text_area("💭 Envies particulières ?")
-        photos_frigo = st.file_uploader("Prendre le stock en photo", type=["jpg", "png"], accept_multiple_files=True)
+        photos_frigo = st.file_uploader("Stock en photo", type=["jpg", "png"], accept_multiple_files=True)
         mode_strict = st.checkbox("🚨 Mode Strict (0 courses)") if photos_frigo else False
 
         if st.button("🪄 Générer ma semaine"):
             with st.spinner(f"Création de la {identifiant_semaine}..."):
                 nouveau_menu = generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos_frigo, mode_strict)
                 if nouveau_menu:
-                    # 1. Sauvegarde pour l'utilisateur qui a cliqué
-                    current_user_data["menus_sauvegardes"][identifiant_semaine] = {"menu": nouveau_menu, "liste_courses": None}
+                    # On injecte la date technique (date_iso) pour permettre au robot nettoyeur de faire son travail
+                    current_user_data["menus_sauvegardes"][identifiant_semaine] = {
+                        "menu": nouveau_menu, 
+                        "liste_courses": None,
+                        "date_iso": date_debut.isoformat() 
+                    }
                     save_current()
 
-                    # 2. --- LA MAGIE DE LA SYNCHRONISATION (ECRITURE CHEZ L'AUTRE) ---
                     for jour, config in config_semaine.items():
                         partenaire = config['partenaire']
                         if partenaire != "Personne" and partenaire in bdd_users:
                             partenaire_data = bdd_users[partenaire]
                             repas_existant = partenaire_data.get("menus_sauvegardes", {}).get(identifiant_semaine, {}).get("menu", {}).get(jour, {}).get("Soir")
                             
-                            # Si le partenaire n'avait rien prévu ce soir-là, on lui force le plat partagé !
                             if not repas_existant and jour in nouveau_menu and "Soir" in nouveau_menu[jour]:
                                 if "menus_sauvegardes" not in partenaire_data: partenaire_data["menus_sauvegardes"] = {}
-                                if identifiant_semaine not in partenaire_data["menus_sauvegardes"]: partenaire_data["menus_sauvegardes"][identifiant_semaine] = {"menu": {}, "liste_courses": None}
+                                if identifiant_semaine not in partenaire_data["menus_sauvegardes"]: 
+                                    partenaire_data["menus_sauvegardes"][identifiant_semaine] = {"menu": {}, "liste_courses": None, "date_iso": date_debut.isoformat()}
                                 if jour not in partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"]: partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"][jour] = {}
                                 
                                 plat_partage = nouveau_menu[jour]["Soir"].copy()
                                 plat_partage["titre"] = f"🤝 {plat_partage['titre']} (Prévu par {profil.get('prenom', 'Quelqu\'un')})"
                                 
                                 partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"][jour]["Soir"] = plat_partage
-                                sauvegarder_utilisateur(partenaire, partenaire_data) # On enregistre dans la base de données du partenaire !
+                                sauvegarder_utilisateur(partenaire, partenaire_data)
                     
-                    st.success("Menu généré et synchronisé avec succès !")
+                    st.success("Menu généré !")
                     st.rerun()
 
-# --- AFFICHAGE ---
-else:
+# --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
     st.markdown("---")
-    menu = semaine_a_afficher["menu"]
-    tabs = st.tabs(list(menu.keys()))
+    st.subheader("🛒 Liste de Courses")
     
-    for i, (jour, repas_jour) in enumerate(menu.items()):
-        with tabs[i]:
-            for moment in ["Matin", "Midi", "Soir"]:
-                if moment in repas_jour:
-                    plat = repas_jour[moment]
-                    rid = f"{jour}_{moment}"
-                    col1, col2 = st.columns([0.1, 0.9])
-                    with col1:
-                        if st.checkbox("Fait", value=(rid in repas_faits), key=f"c_{rid}"):
-                            if rid not in repas_faits: current_user_data["repas_faits"].append(rid); save_current(); st.rerun()
-                        elif rid in repas_faits: current_user_data["repas_faits"].remove(rid); save_current(); st.rerun()
-                    with col2:
-                        st.subheader(f"{moment} : {plat['titre']}")
-                        with st.expander("Voir recette"): st.write(plat['recette'])
-
-    # --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
-    st.markdown("---")
-    if st.button("📝 Faire la liste de courses pour CETTE semaine"):
+    if st.button("📝 Générer / Actualiser la liste de courses"):
         with st.spinner("Rédaction de la liste en cours..."):
             try:
                 client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
                 res = client.models.generate_content(
                     model=st.secrets["GEMINI_MODEL"], 
-                    contents=f"Fais la liste de courses détaillée et triée par rayon pour ce menu : {json.dumps(menu)}. Format Markdown avec des cases à cocher."
+                    contents=f"Fais la liste de courses détaillée et triée par rayon pour ce menu : {json.dumps(menu)}. Utilise le format Markdown avec des cases à cocher (ex: - [ ] Tomates)."
                 )
                 semaine_a_afficher["liste_courses"] = res.text
                 save_current()
                 st.rerun()
             except Exception as e:
-                st.error("Les serveurs de Google sont un peu surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
+                st.error("Serveurs surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
         
     if semaine_a_afficher.get("liste_courses"): 
         st.markdown(semaine_a_afficher["liste_courses"])
+        
+        # --- EXPORTATION VERS LE TÉLÉPHONE ---
+        st.markdown("---")
+        st.info("💡 **Astuce Mobile :** Exportez cette liste vers votre application Notes pour la cocher au supermarché !")
+        
+        col_export1, col_export2 = st.columns(2)
+        
+        with col_export1:
+            st.download_button(
+                label="📤 Exporter le fichier",
+                data=semaine_a_afficher["liste_courses"],
+                file_name=f"Liste_Courses.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+            st.caption("Télécharge la liste pour l'ouvrir ou la partager vers Notes.")
+            
+        with col_export2:
+            st.code(semaine_a_afficher["liste_courses"], language="markdown")
+            st.caption("👆 Cliquez sur le petit logo en haut à droite du cadre noir pour tout copier d'un coup.")
