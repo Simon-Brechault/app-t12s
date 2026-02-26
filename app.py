@@ -14,14 +14,13 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 def charger_bdd():
     try:
-        # On lit tout le tableau
-        df = conn.read(worksheet="BDD", usecols=[0, 1])
+        # L'ajout de ttl=0 est crucial ici : il empêche Streamlit de garder l'ancienne liste en mémoire !
+        df = conn.read(worksheet="BDD", usecols=[0, 1], ttl=0)
         if df.empty or len(df.columns) < 2:
             return {}
         
         df.columns = ['Utilisateur', 'Data']
         users = {}
-        # On transforme chaque ligne en dictionnaire
         for _, row in df.iterrows():
             if pd.notna(row['Utilisateur']) and pd.notna(row['Data']):
                 try:
@@ -37,7 +36,6 @@ def sauvegarder_utilisateur(nom_utilisateur, data_dict):
     users = charger_bdd()
     users[nom_utilisateur] = data_dict
     
-    # On recrée le tableau avec tous les utilisateurs mis à jour
     df = pd.DataFrame({
         "Utilisateur": list(users.keys()),
         "Data": [json.dumps(v, ensure_ascii=False) for v in users.values()]
@@ -60,23 +58,44 @@ if choix_user == "-- Choisir un profil --":
     st.info("👈 Veuillez sélectionner votre profil à gauche ou en créer un nouveau pour commencer.")
     st.stop()
 
-# --- ECRAN DE CREATION DE PROFIL ---
+# --- ECRAN DE CREATION DE PROFIL (VERSION AVANCÉE) ---
 elif choix_user == "➕ Créer un nouveau profil":
-    st.title("🆕 Créer un profil personnalisé")
-    st.write("Répondez à ces quelques questions pour que Gemini adapte parfaitement ses recettes à votre métabolisme et vos goûts.")
+    st.title("🆕 Bilan Nutritionnel & Profil")
+    st.write("Pour que je puisse concevoir des menus parfaits, parlons un peu de vous.")
     
     with st.form("form_creation"):
-        prenom = st.text_input("Prénom")
-        nom = st.text_input("Nom")
-        objectif = st.selectbox("🎯 Quel est votre objectif principal ?", [
-            "Perte de poids (Style T12S - Sain et équilibré)", 
+        st.subheader("👤 Informations de base")
+        col1, col2 = st.columns(2)
+        prenom = col1.text_input("Prénom")
+        nom = col2.text_input("Nom")
+        
+        st.subheader("🎯 Vos Objectifs")
+        objectif = st.selectbox("Quel est votre objectif principal ?", [
+            "Perte de poids (Style T12S - Sain, équilibré, sans frustration)", 
             "Maintien & Santé (Manger mieux au quotidien)", 
             "Prise de masse musculaire (Riche en protéines)", 
-            "Végétarien Gourmand"
+            "Végétarien Gourmand (Équilibré)"
         ])
-        preferences = st.text_area("⚠️ Avez-vous des allergies ou des aversions ? (ex: pas de porc, sans lactose, je déteste les brocolis...)")
         
-        submit = st.form_submit_button("Créer mon compte")
+        st.subheader("🔥 Votre Métabolisme & Mode de vie")
+        col3, col4 = st.columns(2)
+        activite = col3.selectbox("Niveau d'activité physique", [
+            "Sédentaire (Travail de bureau, peu de sport)", 
+            "Actif (1 à 3 séances de sport par semaine)", 
+            "Très actif (Sportif régulier, travail physique)"
+        ])
+        temps_cuisine = col4.selectbox("Temps maximum en cuisine par repas", [
+            "Express (Moins de 15 minutes)", 
+            "Classique (15 à 30 minutes)", 
+            "J'ai le temps (Plus de 30 minutes)"
+        ])
+
+        st.subheader("🚫 Vos Contraintes Alimentaires")
+        allergies = st.text_input("Allergies ou intolérances médicales (ex: Sans gluten, Sans lactose, Arachides...)", placeholder="Aucune")
+        aversions = st.text_input("Ce que vous détestez manger (ex: Brocolis, Abats, Coriandre...)", placeholder="Rien, je mange de tout")
+        
+        submit = st.form_submit_button("Valider mon profil sur-mesure")
+        
         if submit and prenom and nom:
             nom_complet = f"{prenom} {nom}"
             if nom_complet in bdd_users:
@@ -87,7 +106,10 @@ elif choix_user == "➕ Créer un nouveau profil":
                         "prenom": prenom,
                         "nom": nom,
                         "objectif": objectif,
-                        "preferences": preferences
+                        "activite": activite,
+                        "temps_cuisine": temps_cuisine,
+                        "allergies": allergies if allergies else "Aucune",
+                        "aversions": aversions if aversions else "Aucune"
                     },
                     "menu_semaine": None,
                     "notes_repas": {},
@@ -95,7 +117,7 @@ elif choix_user == "➕ Créer un nouveau profil":
                     "liste_courses": None
                 }
                 sauvegarder_utilisateur(nom_complet, nouveau_profil)
-                st.success("Profil créé avec succès ! Sélectionnez-le maintenant dans le menu de gauche.")
+                st.success("Profil créé avec succès ! Patientez une seconde, la page va s'actualiser...")
                 st.rerun()
     st.stop()
 
@@ -104,7 +126,6 @@ elif choix_user == "➕ Créer un nouveau profil":
 # ==========================================
 current_user_data = bdd_users[choix_user]
 
-# Fonction raccourcie pour sauvegarder la progression de l'utilisateur actuel
 def save_current():
     sauvegarder_utilisateur(choix_user, current_user_data)
 
@@ -124,23 +145,27 @@ def generer_repas(envies, jour_debut_index, photos=None, mode_strict=False):
     repas_a_eviter = [plat for plat, note in notes_repas.items() if note is not None and note <= 2]
     jours_a_generer = jours_semaine[jour_debut_index:]
 
-    # Le prompt est maintenant hyper personnalisé selon le profil !
+    # Le cerveau de l'IA : Le prompt est maintenant ultra-détaillé
     prompt = f"""
-    Tu es un coach en nutrition de classe mondiale. Tu dois créer un menu pour {profil['prenom']}.
-    Voici le profil de {profil['prenom']} :
-    - Objectif principal : {profil['objectif']}
-    - Allergies et aversions (NE JAMAIS UTILISER) : {profil['preferences']}
+    Tu es un coach en nutrition expert et un chef cuisinier. Tu dois créer un menu sur-mesure pour {profil['prenom']}.
+    
+    Voici le bilan nutritionnel de {profil['prenom']} :
+    - Objectif : {profil['objectif']} (Si l'objectif est la perte de poids type 'T12S', privilégie des repas avec des glucides à index glycémique bas, riches en fibres et en bonnes protéines, sans être un régime restrictif).
+    - Mode de vie : {profil['activite']} (Adapte la richesse calorique des plats en conséquence).
+    - Temps en cuisine : {profil['temps_cuisine']}. Tes recettes NE DOIVENT PAS dépasser ce temps de préparation.
+    - 🚨 ALLERGIES (DANGER DE MORT, NE JAMAIS INCLURE) : {profil['allergies']}
+    - 🤢 AVERSIONS (NE PAS INCLURE) : {profil['aversions']}
     
     Génère un menu pour les jours suivants : {jours_a_generer} (Matin, Midi, Soir).
-    - Envies du moment : {envies if envies else "Aucune, surprends-moi !"}
-    - Repas INTERDITS (déjà mal notés) : {repas_a_eviter}
+    - Envies spécifiques de la semaine : {envies if envies else "Aucune, propose un menu varié !"}
+    - Plats interdits (L'utilisateur les a mal notés par le passé) : {repas_a_eviter}
     """
     
     if photos:
         if mode_strict:
-            prompt += "\n\n🚨 CONTRAINTE STRICTE (ANTI-GASPI) : L'utilisateur a fourni des photos de ses placards/frigo. Tu dois EXCLUSIVEMENT utiliser les ingrédients visibles sur ces photos pour créer les recettes. N'ajoute aucun ingrédient qui nécessiterait d'aller faire des courses (sauf sel/poivre/eau)."
+            prompt += "\n\n🚨 CONTRAINTE STRICTE (ANTI-GASPI) : L'utilisateur a fourni des photos de ses placards/frigo. Tu dois EXCLUSIVEMENT utiliser les ingrédients visibles sur ces photos pour créer les recettes. N'ajoute AUCUN ingrédient qui nécessiterait d'aller faire des courses (sauf condiments de base : sel, poivre, huile, eau)."
         else:
-            prompt += "\n\n💡 ASTUCE ANTI-GASPI : Inspire-toi au maximum des ingrédients visibles sur les photos fournies pour vider les restes, mais tu es autorisé à rajouter d'autres ingrédients pour compléter les recettes si besoin."
+            prompt += "\n\n💡 ASTUCE ANTI-GASPI : L'utilisateur a fourni des photos. Inspire-toi EN PRIORITÉ des ingrédients visibles pour vider les restes, mais tu es autorisé à rajouter d'autres produits frais pour que le repas soit parfait."
 
     prompt += """
     RÉPOND UNIQUEMENT AVEC UN OBJET JSON VALIDE (pas de texte avant ou après). 
@@ -172,7 +197,7 @@ def generer_repas(envies, jour_debut_index, photos=None, mode_strict=False):
 
 def generer_liste_courses(menu):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    prompt = f"Voici un menu : {json.dumps(menu)}. Fais la liste de courses détaillée. Regroupe par rayon. Format : cases à cocher Markdown `- [ ] Ingrédient`."
+    prompt = f"Voici le menu de la semaine de {profil['prenom']} : {json.dumps(menu)}. Fais la liste de courses détaillée en tenant compte de ses allergies ({profil['allergies']}). Regroupe par rayon. Format : cases à cocher Markdown `- [ ] Ingrédient`."
     try:
         response = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=prompt)
         return response.text
@@ -183,7 +208,7 @@ def generer_liste_courses(menu):
 # INTERFACE UTILISATEUR PRINCIPALE
 # ==========================================
 st.title(f"🍽️ Le Planificateur de {profil.get('prenom', '')}")
-st.caption(f"Objectif : {profil.get('objectif', '')}")
+st.caption(f"Objectif : {profil.get('objectif', '')} | Temps en cuisine : {profil.get('temps_cuisine', '')}")
 
 with st.sidebar:
     st.markdown("---")
@@ -195,7 +220,6 @@ with st.sidebar:
     st.subheader("📸 Anti-Gaspi Pro")
     st.info("Ajoutez autant de photos que vous le souhaitez !")
     
-    # On utilise file_uploader avec accept_multiple_files, c'est génial sur iPhone !
     photos_frigo = st.file_uploader("Photos (Frigo, Placards...)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
     
     mode_strict = False
@@ -203,7 +227,7 @@ with st.sidebar:
         mode_strict = st.checkbox("🚨 Mode Strict : Cuisiner UNIQUEMENT avec ces ingrédients (0 courses !)")
 
     if st.button("🪄 Générer le menu"):
-        with st.spinner("Gemini analyse votre profil et vos photos..."):
+        with st.spinner("Gemini analyse votre profil et crée vos recettes sur-mesure..."):
             nouveau_menu = generer_repas(envies, jour_index, photos_frigo, mode_strict)
             if nouveau_menu:
                 if menu_semaine is None:
@@ -269,4 +293,4 @@ if menu_semaine:
     if liste_courses:
         st.markdown(liste_courses)
 else:
-    st.info("👈 Remplissez vos critères à gauche et générez le menu !")
+    st.info("👈 Votre profil est prêt. Générez votre premier menu sur-mesure dans le menu de gauche !")
