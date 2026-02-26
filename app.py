@@ -136,7 +136,6 @@ def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
 
 def nettoyer_anciennes_semaines():
     aujourd_hui = datetime.today().date()
-    # On trouve la date exacte du Lundi de la semaine en cours
     lundi_courant = aujourd_hui - timedelta(days=aujourd_hui.weekday())
     
     semaines_a_supprimer = []
@@ -144,18 +143,17 @@ def nettoyer_anciennes_semaines():
         date_iso = data_semaine.get("date_iso")
         if date_iso:
             date_semaine = datetime.fromisoformat(date_iso).date()
-            # Si la date de début de la semaine sauvegardée est avant le lundi actuel
             if date_semaine < lundi_courant:
                 semaines_a_supprimer.append(id_semaine)
                 
     if semaines_a_supprimer:
         for s in semaines_a_supprimer:
-            del current_user_data["menus_sauvegardes"][s] # Supprime le menu
+            del current_user_data["menus_sauvegardes"][s]
             
-        # Nettoyage des cases "Fait" pour ne pas encombrer la mémoire avec des repas supprimés
         jours_gardes = []
         for semaine_data in current_user_data["menus_sauvegardes"].values():
-            jours_gardes.extend(semaine_data["menu"].keys())
+            if isinstance(semaine_data.get("menu"), dict):
+                jours_gardes.extend(semaine_data["menu"].keys())
             
         current_user_data["repas_faits"] = [
             rid for rid in current_user_data.get("repas_faits", [])
@@ -163,7 +161,6 @@ def nettoyer_anciennes_semaines():
         ]
         save_current()
 
-# On lance le nettoyage discrètement à chaque ouverture du profil
 nettoyer_anciennes_semaines()
 
 profil = current_user_data.get("profil", {})
@@ -272,7 +269,6 @@ if not semaine_a_afficher:
             with st.spinner(f"Création de la {identifiant_semaine}..."):
                 nouveau_menu = generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos_frigo, mode_strict)
                 if nouveau_menu:
-                    # On injecte la date technique (date_iso) pour permettre au robot nettoyeur de faire son travail
                     current_user_data["menus_sauvegardes"][identifiant_semaine] = {
                         "menu": nouveau_menu, 
                         "liste_courses": None,
@@ -301,43 +297,77 @@ if not semaine_a_afficher:
                     st.success("Menu généré !")
                     st.rerun()
 
-# --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
+# --- AFFICHAGE ---
+else:
     st.markdown("---")
-    st.subheader("🛒 Liste de Courses")
+    menu = semaine_a_afficher.get("menu", {})
     
-    if st.button("📝 Générer / Actualiser la liste de courses"):
-        with st.spinner("Rédaction de la liste en cours..."):
-            try:
-                client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-                res = client.models.generate_content(
-                    model=st.secrets["GEMINI_MODEL"], 
-                    contents=f"Fais la liste de courses détaillée et triée par rayon pour ce menu : {json.dumps(menu)}. Utilise le format Markdown avec des cases à cocher (ex: - [ ] Tomates)."
-                )
-                semaine_a_afficher["liste_courses"] = res.text
-                save_current()
-                st.rerun()
-            except Exception as e:
-                st.error("Serveurs surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
+    # Bouton pour supprimer une semaine buggée ou qu'on veut recommencer
+    if st.button("🗑️ Supprimer cette programmation", type="primary"):
+        del current_user_data["menus_sauvegardes"][semaine_selectionnee]
+        save_current()
+        st.success("Semaine supprimée avec succès !")
+        st.rerun()
+
+    # Bouclier anti-crash si le menu est vide
+    if not menu:
+        st.warning("⚠️ Oups ! Le menu de cette semaine est vide (erreur de l'IA ou aucun repas généré). Utilisez le bouton rouge ci-dessus pour supprimer cette programmation et la refaire.")
+    else:
+        tabs = st.tabs(list(menu.keys()))
         
-    if semaine_a_afficher.get("liste_courses"): 
-        st.markdown(semaine_a_afficher["liste_courses"])
-        
-        # --- EXPORTATION VERS LE TÉLÉPHONE ---
+        for i, (jour, repas_jour) in enumerate(menu.items()):
+            if not isinstance(repas_jour, dict):
+                continue
+                
+            with tabs[i]:
+                for moment in ["Matin", "Midi", "Soir"]:
+                    if moment in repas_jour and isinstance(repas_jour[moment], dict):
+                        plat = repas_jour[moment]
+                        rid = f"{jour}_{moment}"
+                        col1, col2 = st.columns([0.1, 0.9])
+                        with col1:
+                            if st.checkbox("Fait", value=(rid in repas_faits), key=f"c_{rid}"):
+                                if rid not in repas_faits: current_user_data["repas_faits"].append(rid); save_current(); st.rerun()
+                            elif rid in repas_faits: current_user_data["repas_faits"].remove(rid); save_current(); st.rerun()
+                        with col2:
+                            st.subheader(f"{moment} : {plat.get('titre', 'Repas')}")
+                            with st.expander("Voir recette"): st.write(plat.get('recette', 'Aucune recette détaillée.'))
+
+        # --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
         st.markdown("---")
-        st.info("💡 **Astuce Mobile :** Exportez cette liste vers votre application Notes pour la cocher au supermarché !")
+        st.subheader("🛒 Liste de Courses")
         
-        col_export1, col_export2 = st.columns(2)
-        
-        with col_export1:
-            st.download_button(
-                label="📤 Exporter le fichier",
-                data=semaine_a_afficher["liste_courses"],
-                file_name=f"Liste_Courses.txt",
-                mime="text/plain",
-                use_container_width=True
-            )
-            st.caption("Télécharge la liste pour l'ouvrir ou la partager vers Notes.")
+        if st.button("📝 Générer / Actualiser la liste de courses"):
+            with st.spinner("Rédaction de la liste en cours..."):
+                try:
+                    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+                    res = client.models.generate_content(
+                        model=st.secrets["GEMINI_MODEL"], 
+                        contents=f"Fais la liste de courses détaillée et triée par rayon pour ce menu : {json.dumps(menu)}. Utilise le format Markdown avec des cases à cocher (ex: - [ ] Tomates)."
+                    )
+                    semaine_a_afficher["liste_courses"] = res.text
+                    save_current()
+                    st.rerun()
+                except Exception as e:
+                    st.error("Serveurs surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
             
-        with col_export2:
-            st.code(semaine_a_afficher["liste_courses"], language="markdown")
-            st.caption("👆 Cliquez sur le petit logo en haut à droite du cadre noir pour tout copier d'un coup.")
+        if semaine_a_afficher.get("liste_courses"): 
+            st.markdown(semaine_a_afficher["liste_courses"])
+            
+            # --- EXPORTATION VERS LE TÉLÉPHONE ---
+            st.markdown("---")
+            st.info("💡 **Astuce Mobile :** Exportez cette liste vers votre application Notes pour la cocher au supermarché !")
+            
+            col_export1, col_export2 = st.columns(2)
+            
+            with col_export1:
+                st.download_button(
+                    label="📤 Exporter le fichier",
+                    data=semaine_a_afficher["liste_courses"],
+                    file_name=f"Liste_Courses.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+                
+            with col_export2:
+                st.code(semaine_a_afficher["liste_courses"], language="markdown")
