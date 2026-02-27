@@ -401,4 +401,6 @@ else:
             
             col_export1, col_export2 = st.columns(2)
             with col_export1:
-                st.download_button(label="📤 Exporter le fichier", data
+                st.download_button(label="📤 Exporter le fichier", data=semaine_a_afficher["liste_courses"], file_name=f"Liste_Courses.txt", mime="text/plain", use_container_width=True)
+            with col_export2:
+                st.code(semaine_a_afficher["liste_courses"], language="markdown")
