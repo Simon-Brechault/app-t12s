@@ -257,6 +257,35 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diver
         st.error(f"Erreur API : {e}")
         return None, None
 
+def regenerer_un_repas(jour, moment, repas_actuel_titre):
+    """Demande à Gemini de régénérer un seul repas spécifique qui n'a pas plu."""
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    repas_a_eviter = [plat for plat, note in notes_repas.items() if note is not None and note <= 2]
+    repas_a_eviter.append(repas_actuel_titre) # On ajoute le plat actuel à la liste noire temporaire
+
+    prompt = f"""
+    Tu es un coach expert. L'utilisateur n'aime pas le plat proposé ({repas_actuel_titre}).
+    Propose une NOUVELLE idée de repas pour le {moment} de {profil['prenom']}.
+    Objectif : {profil['objectif']} | Calories souhaitées : Similaires à l'ancien plat.
+    Allergies : {profil['allergies']} | Aversions : {profil['aversions']}.
+    
+    🚨 Plats à NE SURTOUT PAS proposer : {repas_a_eviter}.
+
+    NIVEAU DÉBUTANT : Rédige des recettes TRÈS DÉTAILLÉES.
+
+    RÉPOND UNIQUEMENT EN JSON avec cette structure (calories = entier) :
+    {{"titre": "...", "recette": "Étape 1: ...", "calories": 450}}
+    """
+    
+    try:
+        response = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=prompt)
+        clean_json = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(clean_json)
+    except Exception as e:
+        st.error(f"Erreur lors de la régénération : {e}")
+        return None
+
+
 # ==========================================
 # INTERFACE PRINCIPALE
 # ==========================================
@@ -314,7 +343,7 @@ if not semaine_a_afficher:
                         "analyse_matin": analyse_matin,
                         "liste_courses": None,
                         "date_iso": date_debut.isoformat(),
-                        "depenses": {} # <-- Ajout du module pour stocker les calories dépensées
+                        "depenses": {} 
                     }
                     save_current()
 
@@ -389,35 +418,55 @@ else:
                         plat = repas_jour[moment]
                         rid = f"{jour}_{moment}"
                         calories_plat = extraire_calories(plat)
+                        titre_plat = plat.get('titre', 'Repas')
                         
-                        col1, col2 = st.columns([0.1, 0.9])
+                        # --- NOUVEAUTÉ : LA MISE EN PAGE EN 3 COLONNES ---
+                        col1, col2, col3 = st.columns([0.05, 0.65, 0.3])
                         with col1:
                             if st.checkbox("Fait", value=(rid in repas_faits), key=f"c_{rid}"):
                                 if rid not in repas_faits: current_user_data["repas_faits"].append(rid); save_current(); st.rerun()
                             elif rid in repas_faits: current_user_data["repas_faits"].remove(rid); save_current(); st.rerun()
+                        
                         with col2:
-                            st.subheader(f"{moment} : {plat.get('titre', 'Repas')} ({calories_plat} kcal)")
+                            st.subheader(f"{moment} : {titre_plat} ({calories_plat} kcal)")
                             with st.expander("Voir la recette détaillée"): 
                                 st.write(plat.get('recette', 'Aucune recette détaillée.'))
+                                
+                        with col3:
+                            # 1. Le retour des étoiles !
+                            note_actuelle = notes_repas.get(titre_plat, 0) - 1 if notes_repas.get(titre_plat) else None
+                            # On ajoute l'ID de la semaine dans la clé pour éviter les bugs d'affichage
+                            note = st.feedback("stars", key=f"note_{rid}_{semaine_selectionnee}")
+                            if note is not None:
+                                current_user_data["notes_repas"][titre_plat] = note + 1
+                                save_current()
+                                
+                            # 2. Le bouton "Régénérer" !
+                            if st.button("🔄 Changer ce repas", key=f"regen_{rid}_{semaine_selectionnee}"):
+                                with st.spinner("Recherche d'une alternative..."):
+                                    nouveau_plat = regenerer_un_repas(jour, moment, titre_plat)
+                                    if nouveau_plat:
+                                        # On remplace l'ancien plat par le nouveau dans la base de données
+                                        semaine_a_afficher["menu"][jour][moment] = nouveau_plat
+                                        # Il faut regénérer la liste de courses
+                                        semaine_a_afficher["liste_courses"] = None 
+                                        save_current()
+                                        st.rerun()
 
-                # --- NOUVEAUTÉ : BILAN JOURNALIER (OPTIONNEL) ---
+                # --- BILAN JOURNALIER (OPTIONNEL) ---
                 st.markdown("---")
                 st.subheader("⚖️ Ma Balance Énergétique")
                 
-                # Récupère l'ancienne valeur si déjà saisie, sinon 0
                 if "depenses" not in semaine_a_afficher: semaine_a_afficher["depenses"] = {}
                 depense_actuelle = semaine_a_afficher["depenses"].get(jour, 0)
                 
-                # Saisie optionnelle de l'utilisateur
                 depense_input = st.number_input(f"Calories dépensées (Lues sur votre montre en fin de journée)", min_value=0, max_value=10000, value=depense_actuelle, step=50, key=f"dep_{jour}_{semaine_selectionnee}")
                 
-                # Si l'utilisateur a changé la valeur, on sauvegarde en direct
                 if depense_input != depense_actuelle:
                     semaine_a_afficher["depenses"][jour] = depense_input
                     save_current()
                     st.rerun()
                 
-                # Le verdict du Coach (Seulement s'il a rempli la case !)
                 if depense_input > 0:
                     diff = cal_jour - depense_input
                     objectif_user = profil.get("objectif", "")
@@ -425,12 +474,10 @@ else:
                     if "Perte" in objectif_user:
                         if diff < 0: st.success(f"✅ **Contrat rempli !** Vous êtes en déficit de {abs(diff)} kcal. C'est parfait pour une perte de poids saine.")
                         else: st.warning(f"⚠️ **Attention :** Vous êtes en excédent de {diff} kcal aujourd'hui. Vous avez mangé plus que ce que vous avez dépensé.")
-                    
                     elif "Prise" in objectif_user:
                         if diff > 0: st.success(f"✅ **Contrat rempli !** Vous êtes en excédent de {diff} kcal. C'est parfait pour nourrir vos muscles.")
                         else: st.warning(f"⚠️ **Attention :** Vous êtes en déficit de {abs(diff)} kcal. Il faut manger plus pour développer votre masse musculaire !")
-                    
-                    else: # Maintien ou Végétarien basique
+                    else: 
                         if abs(diff) <= 300: st.success(f"✅ **Équilibre respecté !** Une différence minime de {diff} kcal, c'est idéal pour le maintien.")
                         else: st.info(f"💡 **Bilan du jour :** Il y a un écart de {abs(diff)} kcal entre vos dépenses et vos repas.")
                 else:
