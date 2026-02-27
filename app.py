@@ -97,7 +97,15 @@ def afficher_formulaire_profil(donnees_existantes=None):
         temps_cuisine = st.selectbox("Temps en cuisine par repas", ["Moins de 15 min", "15 à 30 min", "Plus de 30 min"], index=0 if not is_edit else ["Moins de 15 min", "15 à 30 min", "Plus de 30 min"].index(p.get("temps_cuisine", "15 à 30 min")))
 
         st.subheader("🏃‍♂️ Activité Sportive")
-        sports = st.text_input("Quels sports pratiquez-vous ? (Séparés par des virgules)", value=p.get("sports", ""), placeholder="ex: Musculation, Vélo, Course à pied")
+        sports = st.text_input("Quels sports pratiquez-vous ? (Séparés par virgules)", value=p.get("sports", ""), placeholder="ex: Musculation, Vélo, Course à pied")
+
+        # --- NOUVEAUTÉ : HABITUDES DU MATIN ---
+        st.subheader("🌅 Habitudes du Matin")
+        habitudes_matin = st.text_area("Que mangez-vous habituellement le matin ?", value=p.get("habitudes_matin", ""), placeholder="ex: Un grand café et 2 tartines de pain avec de la confiture")
+        
+        choix_complexite = ["Simple, rapide et répétitif (Économique & Gain de temps)", "Varié et élaboré"]
+        idx_comp = choix_complexite.index(p.get("complexite_matin", choix_complexite[0])) if p.get("complexite_matin") in choix_complexite else 0
+        complexite_matin = st.selectbox("Type de petit-déjeuner souhaité pour l'avenir", choix_complexite, index=idx_comp)
 
         st.subheader("🚫 Contraintes")
         allergies = st.text_input("Allergies (ex: Gluten, Lactose...)", value=p.get("allergies", ""))
@@ -106,7 +114,12 @@ def afficher_formulaire_profil(donnees_existantes=None):
         if st.form_submit_button("Mettre à jour mon profil" if is_edit else "Créer mon profil"):
             if prenom and nom:
                 nom_complet = f"{prenom} {nom}"
-                nouveau_profil = {"prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, "temps_cuisine": temps_cuisine, "sports": sports, "allergies": allergies, "aversions": aversions}
+                nouveau_profil = {
+                    "prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, 
+                    "temps_cuisine": temps_cuisine, "sports": sports, 
+                    "habitudes_matin": habitudes_matin, "complexite_matin": complexite_matin,
+                    "allergies": allergies, "aversions": aversions
+                }
                 if not is_edit: data_complete = {"profil": nouveau_profil, "menus_sauvegardes": {}, "notes_repas": {}, "repas_faits": []}
                 else:
                     data_complete = bdd_users[nom_complet]
@@ -178,9 +191,9 @@ notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
 
 # ==========================================
-# FONCTIONS API GEMINI
+# FONCTIONS API GEMINI (INTELLIGENCE RENFORCÉE)
 # ==========================================
-def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos=None, mode_strict=False):
+def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diversite_repas, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     repas_a_eviter = [plat for plat, note in notes_repas.items() if note is not None and note <= 2]
 
@@ -201,12 +214,27 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photo
             if repas_existant: prompt += f"\n  🚨 Le repas du Soir est partagé avec {config['partenaire']} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS IMPÉRATIVEMENT intégrer cette recette pour le Soir."
             else: prompt += f"\n  🤝 Le repas du Soir sera partagé avec {config['partenaire']}. Respecte ses allergies : {partenaire_data.get('profil', {}).get('allergies', 'Aucune')}."
 
+    prompt += f"\n\n🌅 GESTION DU PETIT-DÉJEUNER :"
+    prompt += f"\n- Habitudes actuelles : {profil.get('habitudes_matin', 'Non renseignées')}."
+    prompt += f"\n- Règle 1 : Rédige une brève analyse (1 ou 2 phrases bienveillantes) de ces habitudes pour la clé JSON 'analyse_habitudes_matin' (indique si c'est bien ou pas pour son objectif)."
+    prompt += f"\n- Règle 2 : L'utilisateur souhaite des petits-déjeuners : {profil.get('complexite_matin', 'Simple, rapide et répétitif')}."
+    prompt += f"\n- Règle 3 : Tu DOIS créer 2 ou 3 petits-déjeuners types MAXIMUM pour toute la semaine, et les répéter. Ne crée surtout pas un petit-déjeuner différent chaque jour !"
+
+    prompt += f"\n\n🔄 DIVERSITÉ MIDI & SOIR :"
+    prompt += f"\n- Niveau de diversité demandé : {diversite_repas}."
+    prompt += f"\n- Si la diversité est 'Normale', IMITE LA VRAIE VIE : répète des plats (ex: le dîner du lundi est mangé en reste le mardi midi) ou alterne entre 3-4 grosses recettes pour faire des économies et gagner du temps. Ne crée pas 14 plats uniques."
+
     prompt += f"\n\nEnvies générales : {envies if envies else 'Varié'}."
     prompt += f"\nRepas interdits (déjà mal notés) : {repas_a_eviter}."
     if photos: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos." if mode_strict else "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
-    prompt += """\nRÉPOND UNIQUEMENT EN JSON avec cette structure :
-    {"Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}}"""
+    prompt += """\nRÉPOND UNIQUEMENT EN JSON avec cette structure (respecte scrupuleusement les clés) :
+    {
+      "analyse_habitudes_matin": "Ton avis de coach sur les habitudes du matin...",
+      "semaine": {
+        "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}
+      }
+    }"""
 
     contenu_a_envoyer = [prompt]
     if photos:
@@ -217,10 +245,15 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photo
     try:
         response = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=contenu_a_envoyer)
         clean_json = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(clean_json)
+        parsed = json.loads(clean_json)
+        # Gestion intelligente du JSON pour éviter les crashs si l'IA modifie la structure
+        if "semaine" in parsed:
+            return parsed["semaine"], parsed.get("analyse_habitudes_matin", "")
+        else:
+            return parsed, ""
     except Exception as e:
         st.error(f"Erreur API : {e}")
-        return None
+        return None, None
 
 # ==========================================
 # INTERFACE PRINCIPALE
@@ -260,6 +293,11 @@ if not semaine_a_afficher:
             config_semaine[jour] = {"repas": repas, "sport": sport, "temps_sport": temps, "partenaire": partenaire}
 
     with st.sidebar:
+        # --- NOUVEAUTÉ : DIVERSITÉ ---
+        st.markdown("---")
+        st.subheader("🔄 Diversité")
+        diversite_repas = st.selectbox("Organisation des repas", ["Normale (Plats qui reviennent, restes = Économique)", "Élevée (1 plat différent à chaque repas = Plus cher)"])
+
         st.markdown("---")
         envies = st.text_area("💭 Envies particulières ?")
         photos_frigo = st.file_uploader("Stock en photo", type=["jpg", "png"], accept_multiple_files=True)
@@ -267,15 +305,17 @@ if not semaine_a_afficher:
 
         if st.button("🪄 Générer ma semaine"):
             with st.spinner(f"Création de la {identifiant_semaine}..."):
-                nouveau_menu = generer_repas_intelligent(envies, config_semaine, identifiant_semaine, photos_frigo, mode_strict)
+                nouveau_menu, analyse_matin = generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diversite_repas, photos_frigo, mode_strict)
                 if nouveau_menu:
                     current_user_data["menus_sauvegardes"][identifiant_semaine] = {
                         "menu": nouveau_menu, 
+                        "analyse_matin": analyse_matin,
                         "liste_courses": None,
                         "date_iso": date_debut.isoformat() 
                     }
                     save_current()
 
+                    # Synchronisation avec le partenaire
                     for jour, config in config_semaine.items():
                         partenaire = config['partenaire']
                         if partenaire != "Personne" and partenaire in bdd_users:
@@ -300,18 +340,21 @@ if not semaine_a_afficher:
 # --- AFFICHAGE ---
 else:
     st.markdown("---")
+    
+    # --- NOUVEAUTÉ : LE MOT DU COACH ---
+    if semaine_a_afficher.get("analyse_matin"):
+        st.info(f"💡 **Le mot du Coach sur vos petits-déjeuners :** {semaine_a_afficher['analyse_matin']}")
+        
     menu = semaine_a_afficher.get("menu", {})
     
-    # Bouton pour supprimer une semaine buggée ou qu'on veut recommencer
     if st.button("🗑️ Supprimer cette programmation", type="primary"):
         del current_user_data["menus_sauvegardes"][semaine_selectionnee]
         save_current()
         st.success("Semaine supprimée avec succès !")
         st.rerun()
 
-    # Bouclier anti-crash si le menu est vide
     if not menu:
-        st.warning("⚠️ Oups ! Le menu de cette semaine est vide (erreur de l'IA ou aucun repas généré). Utilisez le bouton rouge ci-dessus pour supprimer cette programmation et la refaire.")
+        st.warning("⚠️ Oups ! Le menu de cette semaine est vide. Utilisez le bouton rouge ci-dessus pour supprimer cette programmation et la refaire.")
     else:
         tabs = st.tabs(list(menu.keys()))
         
@@ -333,7 +376,6 @@ else:
                             st.subheader(f"{moment} : {plat.get('titre', 'Repas')}")
                             with st.expander("Voir recette"): st.write(plat.get('recette', 'Aucune recette détaillée.'))
 
-        # --- LISTE DE COURSES AVEC BOUCLIER ANTI-CRASH ---
         st.markdown("---")
         st.subheader("🛒 Liste de Courses")
         
@@ -354,20 +396,9 @@ else:
         if semaine_a_afficher.get("liste_courses"): 
             st.markdown(semaine_a_afficher["liste_courses"])
             
-            # --- EXPORTATION VERS LE TÉLÉPHONE ---
             st.markdown("---")
             st.info("💡 **Astuce Mobile :** Exportez cette liste vers votre application Notes pour la cocher au supermarché !")
             
             col_export1, col_export2 = st.columns(2)
-            
             with col_export1:
-                st.download_button(
-                    label="📤 Exporter le fichier",
-                    data=semaine_a_afficher["liste_courses"],
-                    file_name=f"Liste_Courses.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
-                
-            with col_export2:
-                st.code(semaine_a_afficher["liste_courses"], language="markdown")
+                st.download_button(label="📤 Exporter le fichier", data
