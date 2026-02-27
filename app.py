@@ -3,6 +3,7 @@ from google import genai
 import json
 from PIL import Image
 import io
+import re
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, timedelta
@@ -72,6 +73,14 @@ def compresser_image(image_file, max_size=(800, 800)):
     buffer.seek(0)
     return Image.open(buffer)
 
+def extraire_calories(plat):
+    if 'calories' in plat and isinstance(plat['calories'], (int, float)):
+        return int(plat['calories'])
+    if 'calories_estimees' in plat:
+        nums = re.findall(r'\d+', str(plat['calories_estimees']))
+        if nums: return int(nums[0])
+    return 0
+
 # ==========================================
 # GESTION DES PROFILS
 # ==========================================
@@ -99,10 +108,16 @@ def afficher_formulaire_profil(donnees_existantes=None):
         st.subheader("🏃‍♂️ Activité Sportive")
         sports = st.text_input("Quels sports pratiquez-vous ? (Séparés par virgules)", value=p.get("sports", ""), placeholder="ex: Musculation, Vélo, Course à pied")
 
-        # --- NOUVEAUTÉ : HABITUDES DU MATIN ---
+        st.subheader("⌚ Objets Connectés (Balance Calorique)")
+        a_montre = st.radio("Portez-vous une montre connectée au quotidien pour suivre votre dépense ?", ["Non", "Oui"], index=0 if p.get("montre", "Non") == "Non" else 1)
+        marque_montre = "Aucune"
+        if a_montre == "Oui":
+            marques_dispos = ["Apple Watch", "Garmin", "Polar", "Wahoo", "Coros", "Suunto", "Samsung Galaxy", "Autre"]
+            idx_marque = marques_dispos.index(p.get("marque_montre", "Garmin")) if p.get("marque_montre") in marques_dispos else 0
+            marque_montre = st.selectbox("Quelle marque ?", marques_dispos, index=idx_marque)
+
         st.subheader("🌅 Habitudes du Matin")
         habitudes_matin = st.text_area("Que mangez-vous habituellement le matin ?", value=p.get("habitudes_matin", ""), placeholder="ex: Un grand café et 2 tartines de pain avec de la confiture")
-        
         choix_complexite = ["Simple, rapide et répétitif (Économique & Gain de temps)", "Varié et élaboré"]
         idx_comp = choix_complexite.index(p.get("complexite_matin", choix_complexite[0])) if p.get("complexite_matin") in choix_complexite else 0
         complexite_matin = st.selectbox("Type de petit-déjeuner souhaité pour l'avenir", choix_complexite, index=idx_comp)
@@ -117,6 +132,7 @@ def afficher_formulaire_profil(donnees_existantes=None):
                 nouveau_profil = {
                     "prenom": prenom, "nom": nom, "poids": poids, "objectif": objectif, 
                     "temps_cuisine": temps_cuisine, "sports": sports, 
+                    "montre": a_montre, "marque_montre": marque_montre,
                     "habitudes_matin": habitudes_matin, "complexite_matin": complexite_matin,
                     "allergies": allergies, "aversions": aversions
                 }
@@ -150,28 +166,19 @@ def save_current(): sauvegarder_utilisateur(choix_user, current_user_data)
 def nettoyer_anciennes_semaines():
     aujourd_hui = datetime.today().date()
     lundi_courant = aujourd_hui - timedelta(days=aujourd_hui.weekday())
-    
     semaines_a_supprimer = []
     for id_semaine, data_semaine in current_user_data.get("menus_sauvegardes", {}).items():
         date_iso = data_semaine.get("date_iso")
         if date_iso:
-            date_semaine = datetime.fromisoformat(date_iso).date()
-            if date_semaine < lundi_courant:
+            if datetime.fromisoformat(date_iso).date() < lundi_courant:
                 semaines_a_supprimer.append(id_semaine)
                 
     if semaines_a_supprimer:
-        for s in semaines_a_supprimer:
-            del current_user_data["menus_sauvegardes"][s]
-            
+        for s in semaines_a_supprimer: del current_user_data["menus_sauvegardes"][s]
         jours_gardes = []
         for semaine_data in current_user_data["menus_sauvegardes"].values():
-            if isinstance(semaine_data.get("menu"), dict):
-                jours_gardes.extend(semaine_data["menu"].keys())
-            
-        current_user_data["repas_faits"] = [
-            rid for rid in current_user_data.get("repas_faits", [])
-            if any(rid.startswith(jour) for jour in jours_gardes)
-        ]
+            if isinstance(semaine_data.get("menu"), dict): jours_gardes.extend(semaine_data["menu"].keys())
+        current_user_data["repas_faits"] = [rid for rid in current_user_data.get("repas_faits", []) if any(rid.startswith(jour) for jour in jours_gardes)]
         save_current()
 
 nettoyer_anciennes_semaines()
@@ -191,7 +198,7 @@ notes_repas = current_user_data.get("notes_repas", {})
 repas_faits = current_user_data.get("repas_faits", [])
 
 # ==========================================
-# FONCTIONS API GEMINI (INTELLIGENCE RENFORCÉE)
+# FONCTIONS API GEMINI
 # ==========================================
 def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diversite_repas, photos=None, mode_strict=False):
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
@@ -206,33 +213,31 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diver
     """
     for jour, config in config_semaine.items():
         prompt += f"\n- {jour} :"
-        prompt += f"\n  Repas à générer : {', '.join(config['repas']) if config['repas'] else 'AUCUN REPAS CE JOUR LA'}"
-        if config['sport'] != "Aucun": prompt += f"\n  Sport prévu : {config['sport']} pendant {config['temps_sport']}."
+        prompt += f"\n  Repas : {', '.join(config['repas']) if config['repas'] else 'AUCUN REPAS CE JOUR LA'}"
+        if config['sport'] != "Aucun": prompt += f"\n  Sport : {config['sport']} pendant {config['temps_sport']}. (Ajuste les calories !)"
         if config['partenaire'] != "Personne":
             partenaire_data = bdd_users.get(config['partenaire'], {})
             repas_existant = partenaire_data.get("menus_sauvegardes", {}).get(identifiant_semaine, {}).get("menu", {}).get(jour, {}).get("Soir")
-            if repas_existant: prompt += f"\n  🚨 Le repas du Soir est partagé avec {config['partenaire']} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS IMPÉRATIVEMENT intégrer cette recette pour le Soir."
+            if repas_existant: prompt += f"\n  🚨 Le repas du Soir est partagé avec {config['partenaire']} qui a DÉJÀ prévu ceci : {repas_existant['titre']}. Tu DOIS l'intégrer."
             else: prompt += f"\n  🤝 Le repas du Soir sera partagé avec {config['partenaire']}. Respecte ses allergies : {partenaire_data.get('profil', {}).get('allergies', 'Aucune')}."
 
     prompt += f"\n\n🌅 GESTION DU PETIT-DÉJEUNER :"
-    prompt += f"\n- Habitudes actuelles : {profil.get('habitudes_matin', 'Non renseignées')}."
-    prompt += f"\n- Règle 1 : Rédige une brève analyse (1 ou 2 phrases bienveillantes) de ces habitudes pour la clé JSON 'analyse_habitudes_matin' (indique si c'est bien ou pas pour son objectif)."
-    prompt += f"\n- Règle 2 : L'utilisateur souhaite des petits-déjeuners : {profil.get('complexite_matin', 'Simple, rapide et répétitif')}."
-    prompt += f"\n- Règle 3 : Tu DOIS créer 2 ou 3 petits-déjeuners types MAXIMUM pour toute la semaine, et les répéter. Ne crée surtout pas un petit-déjeuner différent chaque jour !"
+    prompt += f"\n- Habitudes : {profil.get('habitudes_matin', 'Non renseignées')}."
+    prompt += f"\n- Analyse : Rédige une analyse bienveillante des habitudes pour la clé JSON 'analyse_habitudes_matin'."
+    prompt += f"\n- Demande : {profil.get('complexite_matin', 'Simple, rapide et répétitif')}."
+    prompt += f"\n- Si simple demandé : Répète 2 ou 3 petits-déjeuners max sur toute la semaine."
 
-    prompt += f"\n\n🔄 DIVERSITÉ MIDI & SOIR :"
-    prompt += f"\n- Niveau de diversité demandé : {diversite_repas}."
-    prompt += f"\n- Si la diversité est 'Normale', IMITE LA VRAIE VIE : répète des plats (ex: le dîner du lundi est mangé en reste le mardi midi) ou alterne entre 3-4 grosses recettes pour faire des économies et gagner du temps. Ne crée pas 14 plats uniques."
+    prompt += f"\n\n🔄 DIVERSITÉ & DÉTAILS :"
+    prompt += f"\n- Diversité : {diversite_repas}. Si Normale, répète les restes (ex: dîner du lundi mangé le mardi midi)."
+    prompt += f"\n- NIVEAU DÉBUTANT : Rédige des recettes TRÈS DÉTAILLÉES (étape 1, étape 2, etc.) pour des novices en cuisine."
 
-    prompt += f"\n\nEnvies générales : {envies if envies else 'Varié'}."
-    prompt += f"\nRepas interdits (déjà mal notés) : {repas_a_eviter}."
     if photos: prompt += "\n🚨 MODE STRICT : Utilise UNIQUEMENT les ingrédients des photos." if mode_strict else "\n💡 ANTI-GASPI : Utilise en priorité les ingrédients des photos."
 
-    prompt += """\nRÉPOND UNIQUEMENT EN JSON avec cette structure (respecte scrupuleusement les clés) :
+    prompt += """\nRÉPOND UNIQUEMENT EN JSON avec cette structure précise (la clé 'calories' doit OBLIGATOIREMENT être un NOMBRE ENTIER sans texte) :
     {
-      "analyse_habitudes_matin": "Ton avis de coach sur les habitudes du matin...",
+      "analyse_habitudes_matin": "...",
       "semaine": {
-        "Date 1": {"Matin": {"titre": "...", "recette": "...", "calories_estimees": "..."}, "Midi": {...}, "Soir": {...}}
+        "Date 1": {"Matin": {"titre": "...", "recette": "Étape 1: ...\nÉtape 2: ...", "calories": 450}, "Midi": {...}, "Soir": {...}}
       }
     }"""
 
@@ -246,11 +251,8 @@ def generer_repas_intelligent(envies, config_semaine, identifiant_semaine, diver
         response = client.models.generate_content(model=st.secrets["GEMINI_MODEL"], contents=contenu_a_envoyer)
         clean_json = response.text.strip().replace('```json', '').replace('```', '')
         parsed = json.loads(clean_json)
-        # Gestion intelligente du JSON pour éviter les crashs si l'IA modifie la structure
-        if "semaine" in parsed:
-            return parsed["semaine"], parsed.get("analyse_habitudes_matin", "")
-        else:
-            return parsed, ""
+        if "semaine" in parsed: return parsed["semaine"], parsed.get("analyse_habitudes_matin", "")
+        else: return parsed, ""
     except Exception as e:
         st.error(f"Erreur API : {e}")
         return None, None
@@ -262,6 +264,7 @@ st.title(f"🍽️ Planificateur de {profil.get('prenom', '')}")
 
 liste_semaines = list(current_user_data.get("menus_sauvegardes", {}).keys())
 semaine_a_afficher = None
+semaine_selectionnee = None
 
 col_aff1, col_aff2 = st.columns([0.7, 0.3])
 if liste_semaines:
@@ -293,7 +296,6 @@ if not semaine_a_afficher:
             config_semaine[jour] = {"repas": repas, "sport": sport, "temps_sport": temps, "partenaire": partenaire}
 
     with st.sidebar:
-        # --- NOUVEAUTÉ : DIVERSITÉ ---
         st.markdown("---")
         st.subheader("🔄 Diversité")
         diversite_repas = st.selectbox("Organisation des repas", ["Normale (Plats qui reviennent, restes = Économique)", "Élevée (1 plat différent à chaque repas = Plus cher)"])
@@ -311,11 +313,11 @@ if not semaine_a_afficher:
                         "menu": nouveau_menu, 
                         "analyse_matin": analyse_matin,
                         "liste_courses": None,
-                        "date_iso": date_debut.isoformat() 
+                        "date_iso": date_debut.isoformat(),
+                        "depenses": {} # <-- Ajout du module pour stocker les calories dépensées
                     }
                     save_current()
 
-                    # Synchronisation avec le partenaire
                     for jour, config in config_semaine.items():
                         partenaire = config['partenaire']
                         if partenaire != "Personne" and partenaire in bdd_users:
@@ -325,7 +327,7 @@ if not semaine_a_afficher:
                             if not repas_existant and jour in nouveau_menu and "Soir" in nouveau_menu[jour]:
                                 if "menus_sauvegardes" not in partenaire_data: partenaire_data["menus_sauvegardes"] = {}
                                 if identifiant_semaine not in partenaire_data["menus_sauvegardes"]: 
-                                    partenaire_data["menus_sauvegardes"][identifiant_semaine] = {"menu": {}, "liste_courses": None, "date_iso": date_debut.isoformat()}
+                                    partenaire_data["menus_sauvegardes"][identifiant_semaine] = {"menu": {}, "liste_courses": None, "date_iso": date_debut.isoformat(), "depenses": {}}
                                 if jour not in partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"]: partenaire_data["menus_sauvegardes"][identifiant_semaine]["menu"][jour] = {}
                                 
                                 plat_partage = nouveau_menu[jour]["Soir"].copy()
@@ -340,13 +342,29 @@ if not semaine_a_afficher:
 # --- AFFICHAGE ---
 else:
     st.markdown("---")
-    
-    # --- NOUVEAUTÉ : LE MOT DU COACH ---
     if semaine_a_afficher.get("analyse_matin"):
         st.info(f"💡 **Le mot du Coach sur vos petits-déjeuners :** {semaine_a_afficher['analyse_matin']}")
         
     menu = semaine_a_afficher.get("menu", {})
     
+    total_calories_semaine = 0
+    rids_semaine_actuelle = []
+    
+    if isinstance(menu, dict):
+        for jour, repas_jour in menu.items():
+            if isinstance(repas_jour, dict):
+                for moment, plat in repas_jour.items():
+                    if isinstance(plat, dict):
+                        total_calories_semaine += extraire_calories(plat)
+                        rids_semaine_actuelle.append(f"{jour}_{moment}")
+                        
+    st.success(f"🔥 **Bilan Calorique de la semaine :** {total_calories_semaine} kcal (Apport théorique total estimé).")
+    
+    repas_coches = len([rid for rid in rids_semaine_actuelle if rid in repas_faits])
+    total_repas = len(rids_semaine_actuelle)
+    if total_repas > 0:
+        st.progress(repas_coches / total_repas, text=f"Progression : {repas_coches}/{total_repas} repas dégustés !")
+
     if st.button("🗑️ Supprimer cette programmation", type="primary"):
         del current_user_data["menus_sauvegardes"][semaine_selectionnee]
         save_current()
@@ -354,27 +372,70 @@ else:
         st.rerun()
 
     if not menu:
-        st.warning("⚠️ Oups ! Le menu de cette semaine est vide. Utilisez le bouton rouge ci-dessus pour supprimer cette programmation et la refaire.")
+        st.warning("⚠️ Oups ! Le menu de cette semaine est vide.")
     else:
         tabs = st.tabs(list(menu.keys()))
         
         for i, (jour, repas_jour) in enumerate(menu.items()):
-            if not isinstance(repas_jour, dict):
-                continue
-                
+            if not isinstance(repas_jour, dict): continue
             with tabs[i]:
+                
+                cal_jour = sum(extraire_calories(plat) for plat in repas_jour.values() if isinstance(plat, dict))
+                st.metric(label="Total Calories Ingestées", value=f"{cal_jour} kcal")
+                st.markdown("---")
+                
                 for moment in ["Matin", "Midi", "Soir"]:
                     if moment in repas_jour and isinstance(repas_jour[moment], dict):
                         plat = repas_jour[moment]
                         rid = f"{jour}_{moment}"
+                        calories_plat = extraire_calories(plat)
+                        
                         col1, col2 = st.columns([0.1, 0.9])
                         with col1:
                             if st.checkbox("Fait", value=(rid in repas_faits), key=f"c_{rid}"):
                                 if rid not in repas_faits: current_user_data["repas_faits"].append(rid); save_current(); st.rerun()
                             elif rid in repas_faits: current_user_data["repas_faits"].remove(rid); save_current(); st.rerun()
                         with col2:
-                            st.subheader(f"{moment} : {plat.get('titre', 'Repas')}")
-                            with st.expander("Voir recette"): st.write(plat.get('recette', 'Aucune recette détaillée.'))
+                            st.subheader(f"{moment} : {plat.get('titre', 'Repas')} ({calories_plat} kcal)")
+                            with st.expander("Voir la recette détaillée"): 
+                                st.write(plat.get('recette', 'Aucune recette détaillée.'))
+
+                # --- NOUVEAUTÉ : BILAN JOURNALIER (OPTIONNEL) ---
+                st.markdown("---")
+                st.subheader("⚖️ Ma Balance Énergétique")
+                
+                # Récupère l'ancienne valeur si déjà saisie, sinon 0
+                if "depenses" not in semaine_a_afficher: semaine_a_afficher["depenses"] = {}
+                depense_actuelle = semaine_a_afficher["depenses"].get(jour, 0)
+                
+                # Saisie optionnelle de l'utilisateur
+                depense_input = st.number_input(f"Calories dépensées (Lues sur votre montre en fin de journée)", min_value=0, max_value=10000, value=depense_actuelle, step=50, key=f"dep_{jour}_{semaine_selectionnee}")
+                
+                # Si l'utilisateur a changé la valeur, on sauvegarde en direct
+                if depense_input != depense_actuelle:
+                    semaine_a_afficher["depenses"][jour] = depense_input
+                    save_current()
+                    st.rerun()
+                
+                # Le verdict du Coach (Seulement s'il a rempli la case !)
+                if depense_input > 0:
+                    diff = cal_jour - depense_input
+                    objectif_user = profil.get("objectif", "")
+                    
+                    if "Perte" in objectif_user:
+                        if diff < 0: st.success(f"✅ **Contrat rempli !** Vous êtes en déficit de {abs(diff)} kcal. C'est parfait pour une perte de poids saine.")
+                        else: st.warning(f"⚠️ **Attention :** Vous êtes en excédent de {diff} kcal aujourd'hui. Vous avez mangé plus que ce que vous avez dépensé.")
+                    
+                    elif "Prise" in objectif_user:
+                        if diff > 0: st.success(f"✅ **Contrat rempli !** Vous êtes en excédent de {diff} kcal. C'est parfait pour nourrir vos muscles.")
+                        else: st.warning(f"⚠️ **Attention :** Vous êtes en déficit de {abs(diff)} kcal. Il faut manger plus pour développer votre masse musculaire !")
+                    
+                    else: # Maintien ou Végétarien basique
+                        if abs(diff) <= 300: st.success(f"✅ **Équilibre respecté !** Une différence minime de {diff} kcal, c'est idéal pour le maintien.")
+                        else: st.info(f"💡 **Bilan du jour :** Il y a un écart de {abs(diff)} kcal entre vos dépenses et vos repas.")
+                else:
+                    st.caption("*(Optionnel) Saisissez vos calories dépensées le soir pour débloquer l'analyse du coach.*")
+
 
         st.markdown("---")
         st.subheader("🛒 Liste de Courses")
@@ -391,14 +452,11 @@ else:
                     save_current()
                     st.rerun()
                 except Exception as e:
-                    st.error("Serveurs surchargés. Veuillez réessayer dans quelques secondes ! 🔄")
+                    st.error("Serveurs surchargés. Veuillez réessayer ! 🔄")
             
         if semaine_a_afficher.get("liste_courses"): 
             st.markdown(semaine_a_afficher["liste_courses"])
-            
             st.markdown("---")
-            st.info("💡 **Astuce Mobile :** Exportez cette liste vers votre application Notes pour la cocher au supermarché !")
-            
             col_export1, col_export2 = st.columns(2)
             with col_export1:
                 st.download_button(label="📤 Exporter le fichier", data=semaine_a_afficher["liste_courses"], file_name=f"Liste_Courses.txt", mime="text/plain", use_container_width=True)
